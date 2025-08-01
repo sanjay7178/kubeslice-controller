@@ -70,6 +70,7 @@ rules:
   - controller.kubeslice.io
   resources:
   - clusters
+  - ipamallocations
   - projects
   - serviceexportconfigs
   - sliceconfigs
@@ -87,6 +88,7 @@ rules:
   - controller.kubeslice.io
   resources:
   - clusters/finalizers
+  - ipamallocations/finalizers
   - projects/finalizers
   - serviceexportconfigs/finalizers
   - sliceconfigs/finalizers
@@ -98,6 +100,7 @@ rules:
   - controller.kubeslice.io
   resources:
   - clusters/status
+  - ipamallocations/status
   - projects/status
   - serviceexportconfigs/status
   - sliceconfigs/status
