@@ -44,6 +44,7 @@ type IWorkerSliceConfigService interface {
 	ComputeClusterMap(clusterNames []string, workerSliceConfigs []workerv1alpha1.WorkerSliceConfig) map[string]int
 	CreateMinimalWorkerSliceConfig(ctx context.Context, clusters []string, namespace string, label map[string]string, name, sliceSubnet string, clusterCidr string, sliceGwSvcTypeMap map[string]*controllerv1alpha1.SliceGatewayServiceType) (map[string]int, error)
 	CreateMinimalWorkerSliceConfigForNoNetworkSlice(ctx context.Context, clusters []string, namespace string, label map[string]string, name string) error
+	CreateMinimalWorkerSliceConfigWithDynamicIPAM(ctx context.Context, clusters []string, namespace string, label map[string]string, name, sliceSubnet string, ipamService IDynamicIPAMService) (map[string]int, error)
 }
 
 // WorkerSliceConfigService implements the IWorkerSliceConfigService interface
@@ -691,4 +692,105 @@ func (s *WorkerSliceConfigService) copySpecFromSliceConfigToWorkerSlice(ctx cont
 		return workerv1alpha1.WorkerSliceConfig{}
 	}
 	return slice
+}
+
+// CreateMinimalWorkerSliceConfigWithDynamicIPAM creates worker slice configs using dynamic IPAM
+func (s *WorkerSliceConfigService) CreateMinimalWorkerSliceConfigWithDynamicIPAM(ctx context.Context, clusters []string, namespace string, label map[string]string, name, sliceSubnet string, ipamService IDynamicIPAMService) (map[string]int, error) {
+	logger := util.CtxLogger(ctx)
+	logger.Infof("Creating worker slice configs with dynamic IPAM for slice %s", name)
+
+	eventRecorder := util.CtxEventRecorder(ctx).
+		WithProject(util.GetProjectName(namespace)).
+		WithNamespace(namespace).
+		WithSlice(name)
+
+	clusterMap := make(map[string]int)
+
+	for index, cluster := range clusters {
+		workerSliceConfigName := fmt.Sprintf(workerSliceConfigNameFormat, name, cluster)
+
+		// Allocate subnet for this cluster using dynamic IPAM
+		clusterSubnetCIDR, err := ipamService.AllocateSubnetForCluster(ctx, name, sliceSubnet, cluster, namespace)
+		if err != nil {
+			logger.Errorf("Failed to allocate subnet for cluster %s: %v", cluster, err)
+			return nil, fmt.Errorf("failed to allocate subnet for cluster %s: %w", cluster, err)
+		}
+
+		logger.Infof("Allocated subnet %s for cluster %s", clusterSubnetCIDR, cluster)
+
+		// Store cluster mapping for gateway creation
+		clusterMap[cluster] = index
+
+		// Check if worker slice config already exists
+		existingSlice := &workerv1alpha1.WorkerSliceConfig{}
+		found, err := util.GetResourceIfExist(ctx, client.ObjectKey{
+			Namespace: namespace,
+			Name:      workerSliceConfigName,
+		}, existingSlice)
+		if err != nil {
+			return nil, err
+		}
+
+		if found {
+			// Update existing worker slice config with new subnet if needed
+			if existingSlice.Spec.ClusterSubnetCIDR != clusterSubnetCIDR {
+				existingSlice.Spec.ClusterSubnetCIDR = clusterSubnetCIDR
+				if err := util.UpdateResource(ctx, existingSlice); err != nil {
+					return nil, fmt.Errorf("failed to update worker slice config %s: %w", workerSliceConfigName, err)
+				}
+				logger.Infof("Updated worker slice config %s with new subnet %s", workerSliceConfigName, clusterSubnetCIDR)
+			}
+			continue
+		}
+
+		// Create new worker slice config
+		label["original-slice-name"] = name
+		label["worker-cluster"] = cluster
+		label["kubeslice-manager"] = "controller"
+
+		expectedSlice := workerv1alpha1.WorkerSliceConfig{
+			TypeMeta: metav1.TypeMeta{},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      workerSliceConfigName,
+				Labels:    label,
+				Namespace: namespace,
+			},
+		}
+		expectedSlice.Spec.SliceName = name
+		expectedSlice.Spec.ClusterSubnetCIDR = clusterSubnetCIDR
+		expectedSlice.Spec.SliceSubnet = sliceSubnet
+		expectedSlice.Spec.SliceIpamType = "Dynamic"
+
+		err = util.CreateResource(ctx, &expectedSlice)
+		if err != nil {
+			// Register an event for worker slice config creation failure
+			util.RecordEvent(ctx, eventRecorder, &expectedSlice, nil, events.EventWorkerSliceConfigCreationFailed)
+			s.mf.RecordCounterMetric(metrics.KubeSliceEventsCounter,
+				map[string]string{
+					"action":      "creation_failed",
+					"event":       string(events.EventWorkerSliceConfigCreationFailed),
+					"object_name": expectedSlice.Name,
+					"object_kind": metricKindWorkerSliceConfig,
+				},
+			)
+			if !k8sErrors.IsAlreadyExists(err) {
+				return nil, err
+			}
+		} else {
+			logger.Infof("Created worker slice config %s with dynamic subnet %s", workerSliceConfigName, clusterSubnetCIDR)
+			// Register an event for worker slice config creation
+			util.RecordEvent(ctx, eventRecorder, &expectedSlice, nil, events.EventWorkerSliceConfigCreated)
+			s.mf.RecordCounterMetric(metrics.KubeSliceEventsCounter,
+				map[string]string{
+					"action":      "created",
+					"event":       string(events.EventWorkerSliceConfigCreated),
+					"object_name": expectedSlice.Name,
+					"object_kind": metricKindWorkerSliceConfig,
+				},
+			)
+		}
+	}
+
+	logger.Infof("Successfully created/updated worker slice configs with dynamic IPAM for slice %s", name)
+	return clusterMap, nil
 }

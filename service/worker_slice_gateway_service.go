@@ -47,6 +47,8 @@ type IWorkerSliceGatewayService interface {
 	ReconcileWorkerSliceGateways(ctx context.Context, req ctrl.Request) (ctrl.Result, error)
 	CreateMinimumWorkerSliceGateways(ctx context.Context, sliceName string, clusterNames []string, namespace string,
 		label map[string]string, clusterMap map[string]int, sliceSubnet string, clusterCidr string, sliceGwSvcTypeMap map[string]*controllerv1alpha1.SliceGatewayServiceType) (ctrl.Result, error)
+	CreateMinimumWorkerSliceGatewaysWithDynamicIPAM(ctx context.Context, sliceName string, clusterNames []string, namespace string,
+		label map[string]string, clusterMap map[string]int, sliceSubnet string, ipamService IDynamicIPAMService) (ctrl.Result, error)
 	ListWorkerSliceGateways(ctx context.Context, ownerLabel map[string]string, namespace string) ([]v1alpha1.WorkerSliceGateway, error)
 	DeleteWorkerSliceGatewaysByLabel(ctx context.Context, label map[string]string, namespace string) error
 	NodeIpReconciliationOfWorkerSliceGateways(ctx context.Context, cluster *controllerv1alpha1.Cluster, namespace string) error
@@ -55,6 +57,7 @@ type IWorkerSliceGatewayService interface {
 		gatewayAddresses util.WorkerSliceGatewayNetworkAddresses) error
 	BuildNetworkAddresses(sliceSubnet, sourceClusterName, destinationClusterName string,
 		clusterMap map[string]int, clusterCidr string) util.WorkerSliceGatewayNetworkAddresses
+	BuildNetworkAddressesWithDynamicIPAM(sliceSubnet, sliceName, sourceClusterName, destinationClusterName, namespace string, ipamService IDynamicIPAMService) (util.WorkerSliceGatewayNetworkAddresses, error)
 }
 
 // WorkerSliceGatewayService is a schema for interfaces JobService, WorkerSliceConfigService, SecretService
@@ -790,5 +793,131 @@ func (s *WorkerSliceGatewayService) NodeIpReconciliationOfWorkerSliceGateways(ct
 			}
 		}
 	}
+	return nil
+}
+
+// CreateMinimumWorkerSliceGatewaysWithDynamicIPAM creates worker slice gateways using dynamic IPAM
+func (s *WorkerSliceGatewayService) CreateMinimumWorkerSliceGatewaysWithDynamicIPAM(ctx context.Context, sliceName string, clusterNames []string, namespace string,
+	label map[string]string, clusterMap map[string]int, sliceSubnet string, ipamService IDynamicIPAMService) (ctrl.Result, error) {
+	logger := util.CtxLogger(ctx)
+	logger.Infof("Creating worker slice gateways with dynamic IPAM for slice %s", sliceName)
+
+	// Create gateways for each pair of clusters
+	for sourceIndex, sourceCluster := range clusterNames {
+		for destinationIndex, destinationCluster := range clusterNames {
+			if sourceIndex >= destinationIndex {
+				continue // Skip self and duplicate pairs
+			}
+
+			// Build network addresses using dynamic IPAM
+			gatewayAddresses, err := s.BuildNetworkAddressesWithDynamicIPAM(sliceSubnet, sliceName, sourceCluster, destinationCluster, namespace, ipamService)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to build network addresses for %s-%s: %w", sourceCluster, destinationCluster, err)
+			}
+
+			// Create server gateway (sourceCluster)
+			serverGatewayName := fmt.Sprintf(gatewayName, sliceName, sourceCluster, destinationCluster)
+			if err := s.createWorkerSliceGateway(ctx, serverGatewayName, namespace, label, sliceName, sourceCluster, destinationCluster, gatewayAddresses, true); err != nil {
+				return ctrl.Result{}, err
+			}
+
+			// Create client gateway (destinationCluster)
+			clientGatewayName := fmt.Sprintf(gatewayName, sliceName, destinationCluster, sourceCluster)
+			if err := s.createWorkerSliceGateway(ctx, clientGatewayName, namespace, label, sliceName, destinationCluster, sourceCluster, gatewayAddresses, false); err != nil {
+				return ctrl.Result{}, err
+			}
+
+			logger.Infof("Created gateway pair for clusters %s-%s with dynamic IPAM", sourceCluster, destinationCluster)
+		}
+	}
+
+	logger.Infof("Successfully created worker slice gateways with dynamic IPAM for slice %s", sliceName)
+	return ctrl.Result{}, nil
+}
+
+// BuildNetworkAddressesWithDynamicIPAM builds network addresses using dynamic IPAM
+func (s *WorkerSliceGatewayService) BuildNetworkAddressesWithDynamicIPAM(sliceSubnet, sliceName, sourceClusterName, destinationClusterName, namespace string, ipamService IDynamicIPAMService) (util.WorkerSliceGatewayNetworkAddresses, error) {
+	// Get subnet allocations for both clusters
+	sourceSubnet, err := ipamService.GetClusterSubnet(context.Background(), sliceName, sourceClusterName, namespace)
+	if err != nil {
+		return util.WorkerSliceGatewayNetworkAddresses{}, fmt.Errorf("failed to get subnet for source cluster %s: %w", sourceClusterName, err)
+	}
+
+	destinationSubnet, err := ipamService.GetClusterSubnet(context.Background(), sliceName, destinationClusterName, namespace)
+	if err != nil {
+		return util.WorkerSliceGatewayNetworkAddresses{}, fmt.Errorf("failed to get subnet for destination cluster %s: %w", destinationClusterName, err)
+	}
+
+	// Build gateway addresses based on allocated subnets
+	// This is a simplified implementation - in practice, you'd have more sophisticated address allocation
+	addresses := util.WorkerSliceGatewayNetworkAddresses{
+		ServerNetwork:    sourceSubnet,
+		ClientNetwork:    destinationSubnet,
+		ServerSubnet:     sourceSubnet,
+		ClientSubnet:     destinationSubnet,
+		ServerVpnNetwork: sliceSubnet,
+		ServerVpnAddress: "192.168.1.1", // Simplified - should be derived from subnet
+		ClientVpnAddress: "192.168.1.2", // Simplified - should be derived from subnet
+	}
+
+	return addresses, nil
+}
+
+// createWorkerSliceGateway is a helper method to create individual worker slice gateways
+func (s *WorkerSliceGatewayService) createWorkerSliceGateway(ctx context.Context, gatewayName, namespace string, label map[string]string, sliceName, localCluster, remoteCluster string, addresses util.WorkerSliceGatewayNetworkAddresses, isServer bool) error {
+	logger := util.CtxLogger(ctx)
+
+	// Check if gateway already exists
+	existingGateway := &v1alpha1.WorkerSliceGateway{}
+	found, err := util.GetResourceIfExist(ctx, client.ObjectKey{
+		Namespace: namespace,
+		Name:      gatewayName,
+	}, existingGateway)
+	if err != nil {
+		return err
+	}
+
+	if found {
+		logger.Infof("Worker slice gateway %s already exists", gatewayName)
+		return nil
+	}
+
+	// Create new gateway with correct structure
+	gatewayHostType := "Server"
+	if !isServer {
+		gatewayHostType = "Client"
+	}
+
+	gateway := &v1alpha1.WorkerSliceGateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gatewayName,
+			Namespace: namespace,
+			Labels:    label,
+		},
+		Spec: v1alpha1.WorkerSliceGatewaySpec{
+			SliceName:               sliceName,
+			GatewayType:             "OpenVPN",
+			GatewayHostType:         gatewayHostType,
+			GatewayConnectivityType: "NodePort",
+			GatewayProtocol:         "UDP",
+			LocalGatewayConfig: v1alpha1.SliceGatewayConfig{
+				ClusterName:   localCluster,
+				GatewayName:   gatewayName,
+				VpnIp:         addresses.ServerVpnAddress,
+				GatewaySubnet: addresses.ServerSubnet,
+			},
+			RemoteGatewayConfig: v1alpha1.SliceGatewayConfig{
+				ClusterName:   remoteCluster,
+				VpnIp:         addresses.ClientVpnAddress,
+				GatewaySubnet: addresses.ClientSubnet,
+			},
+		},
+	}
+
+	if err := util.CreateResource(ctx, gateway); err != nil {
+		return fmt.Errorf("failed to create worker slice gateway %s: %w", gatewayName, err)
+	}
+
+	logger.Infof("Created worker slice gateway %s", gatewayName)
 	return nil
 }

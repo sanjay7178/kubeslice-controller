@@ -127,10 +127,11 @@ var _ = BeforeSuite(func() {
 	se := service.WithServiceExportConfigService(wsi, mr)
 	wsgrs := service.WithWorkerSliceGatewayRecyclerService()
 	vpn := service.WithVpnKeyRotationService(wsgs, wscs)
-	sc := service.WithSliceConfigService(ns, acs, wsgs, wscs, wsi, se, wsgrs, mr, vpn)
+	ipam := service.WithDynamicIPAMService()
+	sc := service.WithSliceConfigService(ns, acs, wsgs, wscs, wsi, se, wsgrs, mr, vpn, ipam)
 	sqcs := service.WithSliceQoSConfigService(wscs, mr)
 	p := service.WithProjectService(ns, acs, c, sc, se, sqcs, mr)
-	svc = service.WithServices(wscs, p, c, sc, se, wsgs, wsi, sqcs, wsgrs, vpn)
+	svc = service.WithServices(wscs, p, c, sc, se, wsgs, wsi, sqcs, wsgrs, vpn, ipam)
 
 	service.ProjectNamespacePrefix = util.AppendHyphenAndPercentageSToString("kubeslice")
 	rbacResourcePrefix := util.AppendHyphenToString("kubeslice-rbac")

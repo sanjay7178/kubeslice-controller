@@ -49,6 +49,7 @@ type SliceConfigService struct {
 	wsgrs IWorkerSliceGatewayRecyclerService
 	mf    metrics.IMetricRecorder
 	vpn   IVpnKeyRotationService
+	ipam  IDynamicIPAMService
 }
 
 const NamespaceAndClusterFormat = "namespace=%s&cluster=%s"
@@ -190,23 +191,44 @@ func (s *SliceConfigService) ReconcileSliceConfig(ctx context.Context, req ctrl.
 		return ctrl.Result{}, err
 	}
 
-	// Step 4: Creation of worker slice Objects and Cluster Labels
-	// get cluster cidr from maxClusters of slice config
-	clusterCidr := ""
-	clusterCidr = util.FindCIDRByMaxClusters(sliceConfig.Spec.MaxClusters)
+	// Step 4: Use Dynamic IPAM for subnet allocation
+	if sliceConfig.Spec.SliceIpamType == "Dynamic" || sliceConfig.Spec.SliceIpamType == "" {
+		// Use dynamic IPAM - reconcile allocations for current clusters
+		if err := s.ipam.ReconcileIPAMAllocation(ctx, sliceConfig.Name, sliceConfig.Spec.SliceSubnet, req.Namespace, sliceConfig.Spec.Clusters); err != nil {
+			logger.Errorf("Failed to reconcile dynamic IPAM allocation: %v", err)
+			return ctrl.Result{}, err
+		}
 
-	// collect slice gw svc info for given clusters
-	sliceGwSvcTypeMap := getSliceGwSvcTypes(sliceConfig)
+		// Create worker slice configs with dynamic allocation
+		clusterMap, err := s.ms.CreateMinimalWorkerSliceConfigWithDynamicIPAM(ctx, sliceConfig.Spec.Clusters, req.Namespace, ownershipLabel, sliceConfig.Name, sliceConfig.Spec.SliceSubnet, s.ipam)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 
-	clusterMap, err := s.ms.CreateMinimalWorkerSliceConfig(ctx, sliceConfig.Spec.Clusters, req.Namespace, ownershipLabel, sliceConfig.Name, sliceConfig.Spec.SliceSubnet, clusterCidr, sliceGwSvcTypeMap)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
+		// Step 5: Create gateways with dynamic IPAM
+		_, err = s.sgs.CreateMinimumWorkerSliceGatewaysWithDynamicIPAM(ctx, sliceConfig.Name, sliceConfig.Spec.Clusters, req.Namespace, ownershipLabel, clusterMap, sliceConfig.Spec.SliceSubnet, s.ipam)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+	} else {
+		// Fallback to legacy static IPAM for backward compatibility
+		// get cluster cidr from maxClusters of slice config
+		clusterCidr := ""
+		clusterCidr = util.FindCIDRByMaxClusters(sliceConfig.Spec.MaxClusters)
 
-	// Step 5: Create gateways with minimum specification
-	_, err = s.sgs.CreateMinimumWorkerSliceGateways(ctx, sliceConfig.Name, sliceConfig.Spec.Clusters, req.Namespace, ownershipLabel, clusterMap, sliceConfig.Spec.SliceSubnet, clusterCidr, sliceGwSvcTypeMap)
-	if err != nil {
-		return ctrl.Result{}, err
+		// collect slice gw svc info for given clusters
+		sliceGwSvcTypeMap := getSliceGwSvcTypes(sliceConfig)
+
+		clusterMap, err := s.ms.CreateMinimalWorkerSliceConfig(ctx, sliceConfig.Spec.Clusters, req.Namespace, ownershipLabel, sliceConfig.Name, sliceConfig.Spec.SliceSubnet, clusterCidr, sliceGwSvcTypeMap)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		// Step 5: Create gateways with minimum specification
+		_, err = s.sgs.CreateMinimumWorkerSliceGateways(ctx, sliceConfig.Name, sliceConfig.Spec.Clusters, req.Namespace, ownershipLabel, clusterMap, sliceConfig.Spec.SliceSubnet, clusterCidr, sliceGwSvcTypeMap)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 	logger.Infof("sliceConfig %v reconciled", req.NamespacedName)
 

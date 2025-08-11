@@ -1,0 +1,98 @@
+apiVersion: controller.kubeslice.io/v1alpha1
+kind: SliceConfig
+metadata:
+  name: dynamic-ipam-slice
+  namespace: kubeslice-demo
+  labels:
+    project: demo-project
+spec:
+  # Enable dynamic IPAM for efficient IP space utilization
+  sliceIpamType: "Dynamic"
+  
+  # Base slice subnet - dynamic IPAM will allocate smaller subnets from this
+  sliceSubnet: "10.1.0.0/16"
+  
+  # Clusters that will participate in this slice
+  # Dynamic IPAM will allocate subnets on-demand as clusters join
+  clusters:
+    - cluster-east
+    - cluster-west
+    - cluster-central
+  
+  # Network deployment mode
+  overlayNetworkDeploymentMode: single-network
+  
+  # Slice type
+  sliceType: Application
+  
+  # Gateway configuration
+  sliceGatewayProvider:
+    sliceGatewayType: OpenVPN
+    sliceCaType: Local
+    sliceGatewayServiceType:
+      - cluster: cluster-east
+        type: NodePort
+        protocol: UDP
+      - cluster: cluster-west
+        type: LoadBalancer
+        protocol: UDP
+      - cluster: cluster-central
+        type: NodePort
+        protocol: UDP
+  
+  # QoS configuration
+  qosProfileDetails:
+    queueType: HTB
+    priority: 1
+    tcType: BANDWIDTH_CONTROL
+    bandwidthCeilingKbps: 10000
+    bandwidthGuaranteedKbps: 5000
+    dscpClass: Default
+  
+  # Namespace isolation
+  namespaceIsolationProfile:
+    isolationEnabled: true
+    applicationNamespaces:
+      - namespace: app-frontend
+        clusters: ["cluster-east", "cluster-west"]
+      - namespace: app-backend
+        clusters: ["cluster-central"]
+      - namespace: app-database
+        clusters: ["cluster-central"]
+  
+  # Maximum clusters (for compatibility - not used in dynamic IPAM)
+  maxClusters: 10
+  
+  # VPN configuration rotation interval
+  rotationInterval: 30
+
+---
+# The dynamic IPAM system will automatically create this resource
+# to track subnet allocations for the slice
+apiVersion: controller.kubeslice.io/v1alpha1
+kind: IPAMAllocation
+metadata:
+  name: ipam-dynamic-ipam-slice
+  namespace: kubeslice-demo
+  labels:
+    slice-name: dynamic-ipam-slice
+spec:
+  sliceName: dynamic-ipam-slice
+  sliceSubnet: "10.1.0.0/16"
+  clusterAllocations:
+    - clusterName: cluster-east
+      subnetCIDR: "10.1.0.0/24"
+      allocatedAt: "2024-01-15T10:00:00Z"
+      status: Allocated
+    - clusterName: cluster-west
+      subnetCIDR: "10.1.1.0/24"
+      allocatedAt: "2024-01-15T10:01:00Z"
+      status: Allocated
+    - clusterName: cluster-central
+      subnetCIDR: "10.1.2.0/24"
+      allocatedAt: "2024-01-15T10:02:00Z"
+      status: Allocated
+status:
+  allocatedSubnets: 3
+  availableSubnets: 253
+  lastUpdated: "2024-01-15T10:02:00Z"
