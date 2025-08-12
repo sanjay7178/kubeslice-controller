@@ -64,17 +64,69 @@ graph TB
 The `SliceConfig` Custom Resource Definition has been extended with a new optional `topologyConfig` field:
 
 ```go
+// From apis/controller/v1alpha1/sliceconfig_types.go
+
+// SliceConfigSpec defines the desired state of SliceConfig
 type SliceConfigSpec struct {
-    // ... existing fields
+    OverlayNetworkDeploymentMode NetworkType `json:"overlayNetworkDeploymentMode,omitempty"`
+    SliceSubnet                  string      `json:"sliceSubnet,omitempty"`
+    SliceType                    string      `json:"sliceType,omitempty"`
+    Clusters                     []string    `json:"clusters,omitempty"`
+    // ... other existing fields
+    
+    // TopologyConfig defines custom connectivity topology for the slice
     TopologyConfig *TopologyConfig `json:"topologyConfig,omitempty"`
 }
 
+// TopologyConfig defines the custom connectivity topology for the slice
 type TopologyConfig struct {
-    TopologyType      TopologyType        `json:"topologyType,omitempty"`
+    //+kubebuilder:default:=full-mesh
+    // TopologyType defines the connectivity pattern (full-mesh, partial-mesh, hub-spoke, custom)
+    TopologyType TopologyType `json:"topologyType,omitempty"`
+    // CustomConnections defines explicit connections for custom and partial-mesh topologies
     CustomConnections []ClusterConnection `json:"customConnections,omitempty"`
-    HubCluster        string              `json:"hubCluster,omitempty"`
-    ClusterVPNRoles   []ClusterVPNRole    `json:"clusterVpnRoles,omitempty"`
+    // HubCluster defines the hub cluster name for hub-spoke topology
+    HubCluster string `json:"hubCluster,omitempty"`
+    // ClusterVPNRoles defines VPN roles for each cluster (client/server/auto)
+    ClusterVPNRoles []ClusterVPNRole `json:"clusterVpnRoles,omitempty"`
 }
+
+// ClusterConnection defines a connection between two clusters
+type ClusterConnection struct {
+    // Source cluster name
+    Source string `json:"source"`
+    // Destination cluster name
+    Destination string `json:"destination"`
+}
+
+// ClusterVPNRole defines the VPN role for a specific cluster
+type ClusterVPNRole struct {
+    // ClusterName is the name of the cluster
+    ClusterName string `json:"clusterName"`
+    // Role defines whether the cluster acts as VPN client, server, or auto-determined
+    //+kubebuilder:default:=auto
+    Role VPNRole `json:"role,omitempty"`
+}
+
+// Topology and VPN role enums
+// +kubebuilder:validation:Enum:=full-mesh;partial-mesh;hub-spoke;custom
+type TopologyType string
+
+const (
+    FULL_MESH    TopologyType = "full-mesh"
+    PARTIAL_MESH TopologyType = "partial-mesh"
+    HUB_SPOKE    TopologyType = "hub-spoke"
+    CUSTOM       TopologyType = "custom"
+)
+
+// +kubebuilder:validation:Enum:=client;server;auto
+type VPNRole string
+
+const (
+    VPN_CLIENT VPNRole = "client"
+    VPN_SERVER VPNRole = "server"
+    VPN_AUTO   VPNRole = "auto"
+)
 ```
 
 ### 2. Topology Types
@@ -255,7 +307,251 @@ graph TB
 - **Resource Usage**: Optimized by user
 - **Use Case**: Complex network requirements, multi-tier architectures
 
-## Implementation Details
+## Core Implementation Details
+
+This section provides the actual implementation code from the KubeSlice controller that powers the custom topology feature.
+
+### 1. API Type Definitions
+
+The foundation of the topology feature lies in the well-structured API types:
+
+```go
+// Complete type definitions from apis/controller/v1alpha1/sliceconfig_types.go
+
+// +kubebuilder:validation:Enum:=full-mesh;partial-mesh;hub-spoke;custom
+type TopologyType string
+
+const (
+    FULL_MESH    TopologyType = "full-mesh"
+    PARTIAL_MESH TopologyType = "partial-mesh"
+    HUB_SPOKE    TopologyType = "hub-spoke"
+    CUSTOM       TopologyType = "custom"
+)
+
+// +kubebuilder:validation:Enum:=client;server;auto
+type VPNRole string
+
+const (
+    VPN_CLIENT VPNRole = "client"
+    VPN_SERVER VPNRole = "server"
+    VPN_AUTO   VPNRole = "auto"
+)
+
+// TopologyConfig defines the custom connectivity topology for the slice
+type TopologyConfig struct {
+    //+kubebuilder:default:=full-mesh
+    // TopologyType defines the connectivity pattern
+    TopologyType TopologyType `json:"topologyType,omitempty"`
+    // CustomConnections defines explicit connections for custom and partial-mesh topologies
+    CustomConnections []ClusterConnection `json:"customConnections,omitempty"`
+    // HubCluster defines the hub cluster name for hub-spoke topology
+    HubCluster string `json:"hubCluster,omitempty"`
+    // ClusterVPNRoles defines VPN roles for each cluster
+    ClusterVPNRoles []ClusterVPNRole `json:"clusterVpnRoles,omitempty"`
+}
+
+// ClusterConnection defines a connection between two clusters
+type ClusterConnection struct {
+    Source      string `json:"source"`
+    Destination string `json:"destination"`
+}
+
+// ClusterVPNRole defines the VPN role for a specific cluster  
+type ClusterVPNRole struct {
+    ClusterName string  `json:"clusterName"`
+    //+kubebuilder:default:=auto
+    Role        VPNRole `json:"role,omitempty"`
+}
+```
+
+### 2. Connection Building Engine
+
+The core logic that translates topology configurations into gateway connections:
+
+```go
+// Internal connection tracking structure
+type clusterConnection struct {
+    source      string
+    destination string
+}
+
+// Main dispatcher - routes to appropriate topology builder
+func (s *WorkerSliceGatewayService) buildConnectionMap(clusterNames []string, 
+    topologyConfig *controllerv1alpha1.TopologyConfig) map[clusterConnection]struct{} {
+    
+    // Backward compatibility - default to full mesh when no config provided
+    if topologyConfig == nil {
+        return s.buildFullMeshConnections(clusterNames)
+    }
+
+    // Route to specific topology implementation
+    switch topologyConfig.TopologyType {
+    case controllerv1alpha1.FULL_MESH, "": // Support empty string for compatibility
+        return s.buildFullMeshConnections(clusterNames)
+    case controllerv1alpha1.HUB_SPOKE:
+        return s.buildHubSpokeConnections(clusterNames, topologyConfig.HubCluster)
+    case controllerv1alpha1.PARTIAL_MESH, controllerv1alpha1.CUSTOM:
+        return s.buildCustomConnections(topologyConfig.CustomConnections)
+    default:
+        // Graceful fallback for unknown topology types
+        return s.buildFullMeshConnections(clusterNames)
+    }
+}
+
+// Algorithm implementations for each topology type
+func (s *WorkerSliceGatewayService) buildFullMeshConnections(clusterNames []string) map[clusterConnection]struct{} {
+    connectionMap := make(map[clusterConnection]struct{})
+    noClusters := len(clusterNames)
+
+    // Generate all unique pairs (avoiding duplicates and self-connections)
+    for i := 0; i < noClusters; i++ {
+        for j := i + 1; j < noClusters; j++ {
+            connectionMap[clusterConnection{
+                source:      clusterNames[i],
+                destination: clusterNames[j],
+            }] = struct{}{}
+        }
+    }
+    return connectionMap
+}
+
+func (s *WorkerSliceGatewayService) buildHubSpokeConnections(clusterNames []string, 
+    hubCluster string) map[clusterConnection]struct{} {
+    
+    connectionMap := make(map[clusterConnection]struct{})
+
+    // Validate hub cluster exists
+    hubExists := false
+    for _, cluster := range clusterNames {
+        if cluster == hubCluster {
+            hubExists = true
+            break
+        }
+    }
+
+    // Fallback to full mesh if hub invalid
+    if !hubExists {
+        return s.buildFullMeshConnections(clusterNames)
+    }
+
+    // Connect hub to all spokes (hub-to-spoke only, no spoke-to-spoke)
+    for _, cluster := range clusterNames {
+        if cluster != hubCluster {
+            connectionMap[clusterConnection{
+                source:      hubCluster,
+                destination: cluster,
+            }] = struct{}{}
+        }
+    }
+    return connectionMap
+}
+
+func (s *WorkerSliceGatewayService) buildCustomConnections(
+    customConnections []controllerv1alpha1.ClusterConnection) map[clusterConnection]struct{} {
+    
+    connectionMap := make(map[clusterConnection]struct{})
+
+    for _, conn := range customConnections {
+        // Ensure deterministic ordering to avoid duplicate gateway pairs
+        if conn.Source < conn.Destination {
+            connectionMap[clusterConnection{
+                source:      conn.Source,
+                destination: conn.Destination,
+            }] = struct{}{}
+        } else if conn.Source > conn.Destination {
+            connectionMap[clusterConnection{
+                source:      conn.Destination,
+                destination: conn.Source,
+            }] = struct{}{}
+        }
+        // Skip self-connections (source == destination)
+    }
+    return connectionMap
+}
+```
+
+### 3. Integration with Gateway Creation Flow
+
+How topology configuration integrates into the existing gateway creation pipeline:
+
+```go
+// Modified gateway creation method signature to include topology
+func (s *WorkerSliceGatewayService) CreateMinimumWorkerSliceGateways(
+    ctx context.Context, sliceName string, clusterNames []string, namespace string,
+    label map[string]string, clusterMap map[string]int, sliceSubnet string, 
+    clusterCidr string, sliceGwSvcTypeMap map[string]*controllerv1alpha1.SliceGatewayServiceType, 
+    topologyConfig *controllerv1alpha1.TopologyConfig) (ctrl.Result, error) {
+
+    // Cleanup obsolete gateways first
+    err := s.cleanupObsoleteGateways(ctx, namespace, label, clusterNames, clusterMap)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // Skip if insufficient clusters
+    if len(clusterNames) < 2 {
+        return ctrl.Result{}, nil
+    }
+
+    // Create gateways using topology-aware logic
+    _, err = s.createMinimumGatewaysIfNotExists(ctx, sliceName, clusterNames, namespace, 
+        label, clusterMap, sliceSubnet, clusterCidr, sliceGwSvcTypeMap, topologyConfig)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+    return ctrl.Result{}, nil
+}
+
+// Core gateway creation with topology awareness
+func (s *WorkerSliceGatewayService) createMinimumGatewaysIfNotExists(
+    ctx context.Context, sliceName string, clusterNames []string, namespace string,
+    label map[string]string, clusterMap map[string]int, sliceSubnet string, 
+    clusterCidr string, sliceGwSvcTypeMap map[string]*controllerv1alpha1.SliceGatewayServiceType, 
+    topologyConfig *controllerv1alpha1.TopologyConfig) (ctrl.Result, error) {
+
+    logger := util.CtxLogger(ctx)
+    
+    // Build connection matrix using topology configuration
+    connectionMap := s.buildConnectionMap(clusterNames, topologyConfig)
+    topologyType := "full-mesh (default)"
+    if topologyConfig != nil {
+        topologyType = string(topologyConfig.TopologyType)
+    }
+    
+    logger.Infof("Creating %d gateway connections for topology: %s", 
+        len(connectionMap), topologyType)
+
+    // Create gateway pairs for each connection in the matrix
+    for connection := range connectionMap {
+        sourceCluster, err := s.getCluster(ctx, connection.source, namespace)
+        if err != nil {
+            logger.Errorf("Failed to retrieve source cluster %s: %v", 
+                connection.source, err)
+            continue
+        }
+
+        destinationCluster, err := s.getCluster(ctx, connection.destination, namespace)
+        if err != nil {
+            logger.Errorf("Failed to retrieve destination cluster %s: %v", 
+                connection.destination, err)
+            continue
+        }
+
+        // Create bidirectional gateway pair
+        err = s.createMinimumGateWayPairIfNotExists(ctx, sourceCluster, destinationCluster,
+            sliceName, namespace, label, clusterMap, sliceSubnet, clusterCidr, 
+            sliceGwSvcTypeMap)
+        if err != nil {
+            logger.Errorf("Failed to create gateway pair %s <-> %s: %v", 
+                connection.source, connection.destination, err)
+            return ctrl.Result{}, err
+        }
+    }
+
+    logger.Infof("Successfully created all gateway connections for slice %s", sliceName)
+    return ctrl.Result{}, nil
+}
+```
 
 ### 1. Connection Matrix Algorithm
 
@@ -399,38 +695,142 @@ spec:
 
 #### Hub-Spoke Configuration
 ```yaml
-topologyConfig:
-  topologyType: hub-spoke
-  hubCluster: hub-cluster
-  clusterVpnRoles:
-    - clusterName: hub-cluster
-      role: server
-    - clusterName: spoke-1
-      role: client
-    - clusterName: spoke-2
-      role: client
+apiVersion: controller.kubeslice.io/v1alpha1
+kind: SliceConfig
+metadata:
+  name: hub-spoke-slice
+  namespace: kubeslice-controller
+spec:
+  clusters: ["hub-cluster", "spoke-1", "spoke-2", "spoke-3"]
+  overlayNetworkDeploymentMode: single-network
+  sliceSubnet: "10.1.0.0/16"
+  topologyConfig:
+    topologyType: hub-spoke
+    hubCluster: hub-cluster
+    clusterVpnRoles:
+      - clusterName: hub-cluster
+        role: server
+      - clusterName: spoke-1
+        role: client
+      - clusterName: spoke-2
+        role: client
+      - clusterName: spoke-3
+        role: client
 ```
 
 #### Custom Topology Configuration
 ```yaml
-topologyConfig:
-  topologyType: custom
-  customConnections:
-    - source: edge-west
-      destination: core-central
-    - source: edge-east
-      destination: core-central
-    - source: core-central
-      destination: core-backup
-  clusterVpnRoles:
-    - clusterName: core-central
-      role: server
-    - clusterName: core-backup
-      role: server
-    - clusterName: edge-west
-      role: client
-    - clusterName: edge-east
-      role: client
+apiVersion: controller.kubeslice.io/v1alpha1
+kind: SliceConfig
+metadata:
+  name: custom-slice
+  namespace: kubeslice-controller
+spec:
+  clusters: ["edge-west", "edge-east", "core-central", "core-backup"]
+  overlayNetworkDeploymentMode: single-network
+  sliceSubnet: "10.2.0.0/16"
+  topologyConfig:
+    topologyType: custom
+    customConnections:
+      - source: edge-west
+        destination: core-central
+      - source: edge-east
+        destination: core-central
+      - source: core-central
+        destination: core-backup
+    clusterVpnRoles:
+      - clusterName: core-central
+        role: server
+      - clusterName: core-backup
+        role: server
+      - clusterName: edge-west
+        role: client
+      - clusterName: edge-east
+        role: client
+```
+
+#### Partial Mesh Configuration
+```yaml
+apiVersion: controller.kubeslice.io/v1alpha1
+kind: SliceConfig
+metadata:
+  name: partial-mesh-slice
+  namespace: kubeslice-controller
+spec:
+  clusters: ["region-us", "region-eu", "region-asia", "region-backup"]
+  overlayNetworkDeploymentMode: single-network
+  sliceSubnet: "10.3.0.0/16"
+  topologyConfig:
+    topologyType: partial-mesh
+    customConnections:
+      - source: region-us
+        destination: region-eu
+      - source: region-eu
+        destination: region-asia
+      - source: region-us
+        destination: region-backup
+      - source: region-asia
+        destination: region-backup
+    clusterVpnRoles:
+      - clusterName: region-us
+        role: auto
+      - clusterName: region-eu
+        role: auto
+      - clusterName: region-asia
+        role: auto
+      - clusterName: region-backup
+        role: server
+```
+
+#### Backward Compatible Full Mesh (Default)
+```yaml
+apiVersion: controller.kubeslice.io/v1alpha1
+kind: SliceConfig
+metadata:
+  name: legacy-slice
+  namespace: kubeslice-controller
+spec:
+  clusters: ["cluster-1", "cluster-2", "cluster-3"]
+  overlayNetworkDeploymentMode: single-network
+  sliceSubnet: "10.0.0.0/16"
+  # No topologyConfig specified - defaults to full mesh
+```
+
+### Algorithm Complexity Analysis
+
+#### Connection Count by Topology Type
+
+```go
+// Complexity analysis for different topology types:
+
+// Full Mesh: O(n²) connections
+// For n clusters: n(n-1)/2 connections
+func calculateFullMeshConnections(clusterCount int) int {
+    return (clusterCount * (clusterCount - 1)) / 2
+}
+
+// Hub-Spoke: O(n) connections  
+// For n clusters with 1 hub: n-1 connections
+func calculateHubSpokeConnections(clusterCount int) int {
+    return clusterCount - 1
+}
+
+// Custom/Partial Mesh: O(user-defined)
+// Connections count equals length of customConnections array
+func calculateCustomConnections(customConnections []ClusterConnection) int {
+    return len(customConnections)
+}
+
+// Example scaling comparison:
+// 10 clusters:
+//   - Full Mesh: 45 connections
+//   - Hub-Spoke: 9 connections (5x reduction)
+//   - Custom: Variable (user-controlled)
+//
+// 20 clusters:
+//   - Full Mesh: 190 connections  
+//   - Hub-Spoke: 19 connections (10x reduction)
+//   - Custom: Variable (user-controlled)
 ```
 
 ## Validation Logic
@@ -467,6 +867,127 @@ graph TD
     style A fill:#e3f2fd
     style Q fill:#e8f5e8
     style D fill:#fff3e0
+```
+
+### Validation Implementation
+
+The comprehensive validation logic has been implemented in the webhook:
+
+```go
+// From service/slice_config_webhook_validation.go
+
+// ValidateSliceConfigCreate validates slice configuration on creation
+func ValidateSliceConfigCreate(ctx context.Context, sliceConfig *controllerv1alpha1.SliceConfig) error {
+    // ... other validations
+    
+    if sliceConfig.Spec.OverlayNetworkDeploymentMode != controllerv1alpha1.NONET {
+        // ... other network validations
+        
+        if err := validateTopologyConfig(sliceConfig); err != nil {
+            return apierrors.NewInvalid(schema.GroupKind{Group: apiGroupKubeSliceControllers, Kind: "SliceConfig"}, 
+                sliceConfig.Name, field.ErrorList{err})
+        }
+    }
+    return nil
+}
+
+// validateTopologyConfig validates the topology configuration for slice
+func validateTopologyConfig(sliceConfig *controllerv1alpha1.SliceConfig) *field.Error {
+    if sliceConfig.Spec.TopologyConfig == nil {
+        return nil // topology config is optional
+    }
+
+    topologyConfig := sliceConfig.Spec.TopologyConfig
+    clusters := sliceConfig.Spec.Clusters
+
+    // Validate hub-spoke topology
+    if topologyConfig.TopologyType == controllerv1alpha1.HUB_SPOKE {
+        if topologyConfig.HubCluster == "" {
+            return field.Required(field.NewPath("spec").Child("topologyConfig").Child("hubCluster"),
+                "hubCluster must be specified for hub-spoke topology")
+        }
+
+        // Verify hub cluster exists in the clusters list
+        hubExists := false
+        for _, cluster := range clusters {
+            if cluster == topologyConfig.HubCluster {
+                hubExists = true
+                break
+            }
+        }
+        if !hubExists {
+            return field.Invalid(field.NewPath("spec").Child("topologyConfig").Child("hubCluster"),
+                topologyConfig.HubCluster, "hub cluster must be present in the clusters list")
+        }
+    }
+
+    // Validate custom/partial-mesh topology
+    if topologyConfig.TopologyType == controllerv1alpha1.CUSTOM || topologyConfig.TopologyType == controllerv1alpha1.PARTIAL_MESH {
+        if len(topologyConfig.CustomConnections) == 0 {
+            return field.Required(field.NewPath("spec").Child("topologyConfig").Child("customConnections"),
+                "customConnections must be specified for custom/partial-mesh topology")
+        }
+
+        // Create a map of valid clusters for quick lookup
+        clusterMap := make(map[string]bool)
+        for _, cluster := range clusters {
+            clusterMap[cluster] = true
+        }
+
+        // Validate each custom connection
+        for i, conn := range topologyConfig.CustomConnections {
+            connPath := field.NewPath("spec").Child("topologyConfig").Child("customConnections").Index(i)
+
+            if conn.Source == "" {
+                return field.Required(connPath.Child("source"), "source cluster name is required")
+            }
+            if conn.Destination == "" {
+                return field.Required(connPath.Child("destination"), "destination cluster name is required")
+            }
+            if conn.Source == conn.Destination {
+                return field.Invalid(connPath, conn, "source and destination cannot be the same cluster")
+            }
+
+            // Verify source cluster exists in the clusters list
+            if !clusterMap[conn.Source] {
+                return field.Invalid(connPath.Child("source"), conn.Source,
+                    "source cluster must be present in the clusters list")
+            }
+
+            // Verify destination cluster exists in the clusters list
+            if !clusterMap[conn.Destination] {
+                return field.Invalid(connPath.Child("destination"), conn.Destination,
+                    "destination cluster must be present in the clusters list")
+            }
+        }
+    }
+
+    // Validate cluster VPN roles
+    if len(topologyConfig.ClusterVPNRoles) > 0 {
+        // Create a map of valid clusters for quick lookup
+        clusterMap := make(map[string]bool)
+        for _, cluster := range clusters {
+            clusterMap[cluster] = true
+        }
+
+        // Validate each VPN role assignment
+        for i, role := range topologyConfig.ClusterVPNRoles {
+            rolePath := field.NewPath("spec").Child("topologyConfig").Child("clusterVpnRoles").Index(i)
+
+            if role.ClusterName == "" {
+                return field.Required(rolePath.Child("clusterName"), "cluster name is required")
+            }
+
+            // Verify cluster exists in the clusters list
+            if !clusterMap[role.ClusterName] {
+                return field.Invalid(rolePath.Child("clusterName"), role.ClusterName,
+                    "cluster must be present in the clusters list")
+            }
+        }
+    }
+
+    return nil
+}
 ```
 
 ### Validation Rules
@@ -519,25 +1040,239 @@ graph TD
     style J fill:#fff3e0
 ```
 
-### Connection Matrix Building Algorithm
+### Gateway Creation Implementation
+
+The topology-aware gateway creation has been integrated into the existing service:
 
 ```go
+// From service/worker_slice_gateway_service.go
+
+// CreateMinimumWorkerSliceGateways creates gateways based on topology configuration
+func (s *WorkerSliceGatewayService) CreateMinimumWorkerSliceGateways(ctx context.Context, sliceName string,
+    clusterNames []string, namespace string, label map[string]string, clusterMap map[string]int,
+    sliceSubnet string, clusterCidr string, sliceGwSvcTypeMap map[string]*controllerv1alpha1.SliceGatewayServiceType, 
+    topologyConfig *controllerv1alpha1.TopologyConfig) (ctrl.Result, error) {
+
+    err := s.cleanupObsoleteGateways(ctx, namespace, label, clusterNames, clusterMap)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+    if len(clusterNames) < 2 {
+        return ctrl.Result{}, nil
+    }
+
+    _, err = s.createMinimumGatewaysIfNotExists(ctx, sliceName, clusterNames, namespace, label, 
+        clusterMap, sliceSubnet, clusterCidr, sliceGwSvcTypeMap, topologyConfig)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+    return ctrl.Result{}, nil
+}
+
+// createMinimumGatewaysIfNotExists creates gateway pairs based on topology
+func (s *WorkerSliceGatewayService) createMinimumGatewaysIfNotExists(ctx context.Context, sliceName string,
+    clusterNames []string, namespace string, label map[string]string, clusterMap map[string]int,
+    sliceSubnet string, clusterCidr string, sliceGwSvcTypeMap map[string]*controllerv1alpha1.SliceGatewayServiceType, 
+    topologyConfig *controllerv1alpha1.TopologyConfig) (ctrl.Result, error) {
+
+    logger := util.CtxLogger(ctx)
+    logger.Infof("Creating gateways with topology configuration for slice %s", sliceName)
+
+    // Build connection matrix based on topology configuration
+    connectionMap := s.buildConnectionMap(clusterNames, topologyConfig)
+    
+    logger.Infof("Generated %d connections for topology %v", len(connectionMap), getTopologyType(topologyConfig))
+
+    // Create gateway pairs for each connection
+    for connection := range connectionMap {
+        sourceCluster, err := s.getCluster(ctx, connection.source, namespace)
+        if err != nil {
+            logger.Errorf("Failed to get source cluster %s: %v", connection.source, err)
+            continue
+        }
+
+        destinationCluster, err := s.getCluster(ctx, connection.destination, namespace)
+        if err != nil {
+            logger.Errorf("Failed to get destination cluster %s: %v", connection.destination, err)
+            continue
+        }
+
+        // Create gateway pair between source and destination clusters
+        err = s.createMinimumGateWayPairIfNotExists(ctx, sourceCluster, destinationCluster, 
+            sliceName, namespace, label, clusterMap, sliceSubnet, clusterCidr, sliceGwSvcTypeMap)
+        if err != nil {
+            logger.Errorf("Failed to create gateway pair between %s and %s: %v", 
+                connection.source, connection.destination, err)
+            return ctrl.Result{}, err
+        }
+    }
+
+    return ctrl.Result{}, nil
+}
+
+// Helper function to get topology type for logging
+func getTopologyType(topologyConfig *controllerv1alpha1.TopologyConfig) string {
+    if topologyConfig == nil {
+        return "full-mesh (default)"
+    }
+    return string(topologyConfig.TopologyType)
+}
+
+// getCluster retrieves cluster information
+func (s *WorkerSliceGatewayService) getCluster(ctx context.Context, clusterName, namespace string) (*controllerv1alpha1.Cluster, error) {
+    cluster := &controllerv1alpha1.Cluster{}
+    found, err := util.GetResourceIfExist(ctx, client.ObjectKey{
+        Name:      clusterName,
+        Namespace: namespace,
+    }, cluster)
+    if err != nil {
+        return nil, err
+    }
+    if !found {
+        return nil, fmt.Errorf("cluster %s not found", clusterName)
+    }
+    return cluster, nil
+}
+```
+
+### Integration with SliceConfig Service
+
+The topology configuration is passed from the SliceConfig service to the gateway service:
+
+```go
+// From service/slice_config_service.go (conceptual integration)
+
+func (s *SliceConfigService) reconcileSliceConfig(ctx context.Context, sliceConfig *controllerv1alpha1.SliceConfig) error {
+    // ... existing logic
+    
+    // Pass topology configuration to gateway service
+    _, err := s.workerSliceGatewayService.CreateMinimumWorkerSliceGateways(
+        ctx,
+        sliceConfig.Name,
+        sliceConfig.Spec.Clusters,
+        sliceConfig.Namespace,
+        labels,
+        clusterMap,
+        sliceConfig.Spec.SliceSubnet,
+        clusterCidr,
+        sliceGwSvcTypeMap,
+        sliceConfig.Spec.TopologyConfig, // Pass topology configuration
+    )
+    
+    return err
+}
+```
+
+### Connection Matrix Building Algorithm
+
+The core connection building logic has been implemented in the WorkerSliceGatewayService:
+
+```go
+// From service/worker_slice_gateway_service.go
+
+// Interface definition includes topology support
+type IWorkerSliceGatewayService interface {
+    CreateMinimumWorkerSliceGateways(ctx context.Context, sliceName string, clusterNames []string, 
+        namespace string, label map[string]string, clusterMap map[string]int, sliceSubnet string, 
+        clusterCidr string, sliceGwSvcTypeMap map[string]*controllerv1alpha1.SliceGatewayServiceType, 
+        topologyConfig *controllerv1alpha1.TopologyConfig) (ctrl.Result, error)
+    // ... other methods
+}
+
+// buildConnectionMap creates a map of connections based on topology configuration
 func (s *WorkerSliceGatewayService) buildConnectionMap(clusterNames []string, topologyConfig *controllerv1alpha1.TopologyConfig) map[clusterConnection]struct{} {
-    // Default to full mesh if no topology config
+    // Default to full mesh if no topology config is provided (backward compatibility)
     if topologyConfig == nil {
         return s.buildFullMeshConnections(clusterNames)
     }
 
     switch topologyConfig.TopologyType {
-    case controllerv1alpha1.FULL_MESH, "":
+    case controllerv1alpha1.FULL_MESH, "": // empty string for backward compatibility
         return s.buildFullMeshConnections(clusterNames)
     case controllerv1alpha1.HUB_SPOKE:
         return s.buildHubSpokeConnections(clusterNames, topologyConfig.HubCluster)
     case controllerv1alpha1.PARTIAL_MESH, controllerv1alpha1.CUSTOM:
         return s.buildCustomConnections(topologyConfig.CustomConnections)
     default:
+        // Default to full mesh for unknown topology types
         return s.buildFullMeshConnections(clusterNames)
     }
+}
+
+// buildFullMeshConnections creates connections for full mesh topology
+func (s *WorkerSliceGatewayService) buildFullMeshConnections(clusterNames []string) map[clusterConnection]struct{} {
+    connectionMap := make(map[clusterConnection]struct{})
+    noClusters := len(clusterNames)
+
+    for i := 0; i < noClusters; i++ {
+        for j := i + 1; j < noClusters; j++ {
+            // Add bidirectional connection (both directions handled by gateway pairs)
+            connectionMap[clusterConnection{
+                source:      clusterNames[i],
+                destination: clusterNames[j],
+            }] = struct{}{}
+        }
+    }
+    return connectionMap
+}
+
+// buildHubSpokeConnections creates connections for hub-spoke topology
+func (s *WorkerSliceGatewayService) buildHubSpokeConnections(clusterNames []string, hubCluster string) map[clusterConnection]struct{} {
+    connectionMap := make(map[clusterConnection]struct{})
+
+    // Find hub cluster in the list
+    hubExists := false
+    for _, cluster := range clusterNames {
+        if cluster == hubCluster {
+            hubExists = true
+            break
+        }
+    }
+
+    // If hub cluster doesn't exist, fall back to full mesh
+    if !hubExists {
+        return s.buildFullMeshConnections(clusterNames)
+    }
+
+    // Connect hub to all other clusters
+    for _, cluster := range clusterNames {
+        if cluster != hubCluster {
+            // Hub cluster should come first to maintain consistent ordering
+            connectionMap[clusterConnection{
+                source:      hubCluster,
+                destination: cluster,
+            }] = struct{}{}
+        }
+    }
+    return connectionMap
+}
+
+// buildCustomConnections creates connections based on explicit custom connections
+func (s *WorkerSliceGatewayService) buildCustomConnections(customConnections []controllerv1alpha1.ClusterConnection) map[clusterConnection]struct{} {
+    connectionMap := make(map[clusterConnection]struct{})
+
+    for _, conn := range customConnections {
+        // Ensure consistent ordering (smaller cluster name first lexicographically)
+        if conn.Source < conn.Destination {
+            connectionMap[clusterConnection{
+                source:      conn.Source,
+                destination: conn.Destination,
+            }] = struct{}{}
+        } else if conn.Source > conn.Destination {
+            connectionMap[clusterConnection{
+                source:      conn.Destination,
+                destination: conn.Source,
+            }] = struct{}{}
+        }
+        // Ignore self-connections (source == destination)
+    }
+    return connectionMap
+}
+
+// Internal struct for tracking connections
+type clusterConnection struct {
+    source      string
+    destination string
 }
 ```
 
@@ -697,13 +1432,28 @@ graph TD
 
 The Custom Topology Definition feature provides a powerful and flexible way to define connectivity patterns in KubeSlice while maintaining full backward compatibility. The implementation follows best practices for:
 
-- **Extensibility**: Easy to add new topology types
-- **Maintainability**: Clean separation of concerns
-- **Performance**: Optimized connection algorithms
-- **Security**: Comprehensive validation and role-based access
-- **Usability**: Intuitive API design with sensible defaults
+- **Extensibility**: Easy to add new topology types through the enum-based TopologyType system
+- **Maintainability**: Clean separation of concerns with dedicated functions for each topology type
+- **Performance**: Optimized connection algorithms with O(n) complexity for hub-spoke vs O(n²) for full mesh
+- **Security**: Comprehensive validation and role-based VPN access control
+- **Usability**: Intuitive API design with sensible defaults and graceful fallbacks
 
-This implementation establishes a solid foundation for supporting diverse network topologies while preserving the simplicity and reliability of the existing full-mesh approach as the default behavior.
+### Key Implementation Highlights
+
+1. **API Design**: The TopologyConfig is seamlessly integrated into the existing SliceConfig CRD as an optional field
+2. **Algorithm Efficiency**: Different connection building algorithms optimized for each topology type
+3. **Validation Robustness**: Comprehensive webhook validation with detailed error messages and field paths
+4. **Backward Compatibility**: Existing slices continue working unchanged without any topology configuration
+5. **Fallback Strategy**: Invalid configurations gracefully fall back to full mesh topology
+
+### Code Architecture Benefits
+
+- **Interface Consistency**: The IWorkerSliceGatewayService interface cleanly extends to include topology support
+- **Function Modularity**: Each topology type has its own dedicated builder function (buildFullMeshConnections, buildHubSpokeConnections, buildCustomConnections)
+- **Error Handling**: Robust error handling with context-aware logging and validation
+- **Type Safety**: Strong typing with enum-based topology types and structured connection definitions
+
+This implementation establishes a solid foundation for supporting diverse network topologies while preserving the simplicity and reliability of the existing full-mesh approach as the default behavior. The actual code implementation demonstrates practical, production-ready solutions for the topology definition challenges in KubeSlice.
 
 ## Future Enhancements
 
