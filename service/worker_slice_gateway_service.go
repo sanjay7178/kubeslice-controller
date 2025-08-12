@@ -46,7 +46,7 @@ const gatewayName = "%s-%s-%s"
 type IWorkerSliceGatewayService interface {
 	ReconcileWorkerSliceGateways(ctx context.Context, req ctrl.Request) (ctrl.Result, error)
 	CreateMinimumWorkerSliceGateways(ctx context.Context, sliceName string, clusterNames []string, namespace string,
-		label map[string]string, clusterMap map[string]int, sliceSubnet string, clusterCidr string, sliceGwSvcTypeMap map[string]*controllerv1alpha1.SliceGatewayServiceType) (ctrl.Result, error)
+		label map[string]string, clusterMap map[string]int, sliceSubnet string, clusterCidr string, sliceGwSvcTypeMap map[string]*controllerv1alpha1.SliceGatewayServiceType, topologyConfig *controllerv1alpha1.TopologyConfig) (ctrl.Result, error)
 	ListWorkerSliceGateways(ctx context.Context, ownerLabel map[string]string, namespace string) ([]v1alpha1.WorkerSliceGateway, error)
 	DeleteWorkerSliceGatewaysByLabel(ctx context.Context, label map[string]string, namespace string) error
 	NodeIpReconciliationOfWorkerSliceGateways(ctx context.Context, cluster *controllerv1alpha1.Cluster, namespace string) error
@@ -348,7 +348,7 @@ type IndividualCertPairRequest struct {
 // CreateMinimumWorkerSliceGateways is a function to create gateways with minimum specification
 func (s *WorkerSliceGatewayService) CreateMinimumWorkerSliceGateways(ctx context.Context, sliceName string,
 	clusterNames []string, namespace string, label map[string]string, clusterMap map[string]int,
-	sliceSubnet string, clusterCidr string, sliceGwSvcTypeMap map[string]*controllerv1alpha1.SliceGatewayServiceType) (ctrl.Result, error) {
+	sliceSubnet string, clusterCidr string, sliceGwSvcTypeMap map[string]*controllerv1alpha1.SliceGatewayServiceType, topologyConfig *controllerv1alpha1.TopologyConfig) (ctrl.Result, error) {
 
 	err := s.cleanupObsoleteGateways(ctx, namespace, label, clusterNames, clusterMap)
 	if err != nil {
@@ -358,7 +358,7 @@ func (s *WorkerSliceGatewayService) CreateMinimumWorkerSliceGateways(ctx context
 		return ctrl.Result{}, nil
 	}
 
-	_, err = s.createMinimumGatewaysIfNotExists(ctx, sliceName, clusterNames, namespace, label, clusterMap, sliceSubnet, clusterCidr, sliceGwSvcTypeMap)
+	_, err = s.createMinimumGatewaysIfNotExists(ctx, sliceName, clusterNames, namespace, label, clusterMap, sliceSubnet, clusterCidr, sliceGwSvcTypeMap, topologyConfig)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -438,8 +438,7 @@ func (s *WorkerSliceGatewayService) cleanupObsoleteGateways(ctx context.Context,
 // createMinimumGatewaysIfNotExists is a helper function to create the gateways between worker clusters if not exists
 func (s *WorkerSliceGatewayService) createMinimumGatewaysIfNotExists(ctx context.Context, sliceName string,
 	clusterNames []string, namespace string, ownerLabel map[string]string, clusterMap map[string]int,
-	sliceSubnet string, clusterCidr string, sliceGwSvcTypeMap map[string]*controllerv1alpha1.SliceGatewayServiceType) (ctrl.Result, error) {
-	noClusters := len(clusterNames)
+	sliceSubnet string, clusterCidr string, sliceGwSvcTypeMap map[string]*controllerv1alpha1.SliceGatewayServiceType, topologyConfig *controllerv1alpha1.TopologyConfig) (ctrl.Result, error) {
 	logger := util.CtxLogger(ctx)
 	clusterMapping := map[string]*controllerv1alpha1.Cluster{}
 	for _, clusterName := range clusterNames {
@@ -450,28 +449,130 @@ func (s *WorkerSliceGatewayService) createMinimumGatewaysIfNotExists(ctx context
 		}
 		clusterMapping[clusterName] = &cluster
 	}
-	for i := 0; i < noClusters; i++ {
-		for j := i + 1; j < noClusters; j++ {
-			sourceCluster, destinationCluster := clusterMapping[clusterNames[i]], clusterMapping[clusterNames[j]]
-			gatewayNumber := s.calculateGatewayNumber(clusterMap[sourceCluster.Name], clusterMap[destinationCluster.Name])
-			gatewayAddresses := s.BuildNetworkAddresses(sliceSubnet, sourceCluster.Name, destinationCluster.Name, clusterMap, clusterCidr)
-			// determine the gateway svc parameters
-			sliceGwSvcType := defaultSliceGatewayServiceType
-			gwSvcProtocol := defaultSliceGatewayServiceProtocol
-			if val, exists := sliceGwSvcTypeMap[sourceCluster.Name]; exists {
-				sliceGwSvcType = val.Type
-				gwSvcProtocol = val.Protocol
-			}
-			logger.Debugf("setting gwConType in create_minwsg %s", sliceGwSvcType)
-			logger.Debugf("setting gwProto in create_minwsg %s", gwSvcProtocol)
-			err := s.createMinimumGateWayPairIfNotExists(ctx, sourceCluster, destinationCluster, sliceName, namespace, sliceGwSvcType, gwSvcProtocol, ownerLabel, gatewayNumber, gatewayAddresses)
-			if err != nil {
-				return ctrl.Result{}, err
-			}
+
+	// Build connection map based on topology configuration
+	connectionMap := s.buildConnectionMap(clusterNames, topologyConfig)
+
+	// Create gateways based on the connection map
+	for connection := range connectionMap {
+		sourceCluster := clusterMapping[connection.source]
+		destinationCluster := clusterMapping[connection.destination]
+
+		gatewayNumber := s.calculateGatewayNumber(clusterMap[sourceCluster.Name], clusterMap[destinationCluster.Name])
+		gatewayAddresses := s.BuildNetworkAddresses(sliceSubnet, sourceCluster.Name, destinationCluster.Name, clusterMap, clusterCidr)
+
+		// determine the gateway svc parameters
+		sliceGwSvcType := defaultSliceGatewayServiceType
+		gwSvcProtocol := defaultSliceGatewayServiceProtocol
+		if val, exists := sliceGwSvcTypeMap[sourceCluster.Name]; exists {
+			sliceGwSvcType = val.Type
+			gwSvcProtocol = val.Protocol
+		}
+		logger.Debugf("setting gwConType in create_minwsg %s", sliceGwSvcType)
+		logger.Debugf("setting gwProto in create_minwsg %s", gwSvcProtocol)
+
+		err := s.createMinimumGateWayPairIfNotExists(ctx, sourceCluster, destinationCluster, sliceName, namespace, sliceGwSvcType, gwSvcProtocol, ownerLabel, gatewayNumber, gatewayAddresses)
+		if err != nil {
+			return ctrl.Result{}, err
 		}
 	}
 	return ctrl.Result{}, nil
+}
 
+// clusterConnection represents a connection between two clusters
+type clusterConnection struct {
+	source      string
+	destination string
+}
+
+// buildConnectionMap creates a map of connections based on topology configuration
+func (s *WorkerSliceGatewayService) buildConnectionMap(clusterNames []string, topologyConfig *controllerv1alpha1.TopologyConfig) map[clusterConnection]struct{} {
+	// Default to full mesh if no topology config is provided (backward compatibility)
+	if topologyConfig == nil {
+		return s.buildFullMeshConnections(clusterNames)
+	}
+
+	switch topologyConfig.TopologyType {
+	case controllerv1alpha1.FULL_MESH, "": // empty string for backward compatibility
+		return s.buildFullMeshConnections(clusterNames)
+	case controllerv1alpha1.HUB_SPOKE:
+		return s.buildHubSpokeConnections(clusterNames, topologyConfig.HubCluster)
+	case controllerv1alpha1.PARTIAL_MESH, controllerv1alpha1.CUSTOM:
+		return s.buildCustomConnections(topologyConfig.CustomConnections)
+	default:
+		// Default to full mesh for unknown topology types
+		return s.buildFullMeshConnections(clusterNames)
+	}
+}
+
+// buildFullMeshConnections creates connections for full mesh topology
+func (s *WorkerSliceGatewayService) buildFullMeshConnections(clusterNames []string) map[clusterConnection]struct{} {
+	connectionMap := make(map[clusterConnection]struct{})
+	noClusters := len(clusterNames)
+
+	for i := 0; i < noClusters; i++ {
+		for j := i + 1; j < noClusters; j++ {
+			// Add bidirectional connection (both directions handled by gateway pairs)
+			connectionMap[clusterConnection{
+				source:      clusterNames[i],
+				destination: clusterNames[j],
+			}] = struct{}{}
+		}
+	}
+	return connectionMap
+}
+
+// buildHubSpokeConnections creates connections for hub-spoke topology
+func (s *WorkerSliceGatewayService) buildHubSpokeConnections(clusterNames []string, hubCluster string) map[clusterConnection]struct{} {
+	connectionMap := make(map[clusterConnection]struct{})
+
+	// Find hub cluster in the list
+	hubExists := false
+	for _, cluster := range clusterNames {
+		if cluster == hubCluster {
+			hubExists = true
+			break
+		}
+	}
+
+	// If hub cluster doesn't exist, fall back to full mesh
+	if !hubExists {
+		return s.buildFullMeshConnections(clusterNames)
+	}
+
+	// Connect hub to all other clusters
+	for _, cluster := range clusterNames {
+		if cluster != hubCluster {
+			// Hub cluster should come first to maintain consistent ordering
+			connectionMap[clusterConnection{
+				source:      hubCluster,
+				destination: cluster,
+			}] = struct{}{}
+		}
+	}
+	return connectionMap
+}
+
+// buildCustomConnections creates connections based on explicit custom connections
+func (s *WorkerSliceGatewayService) buildCustomConnections(customConnections []controllerv1alpha1.ClusterConnection) map[clusterConnection]struct{} {
+	connectionMap := make(map[clusterConnection]struct{})
+
+	for _, conn := range customConnections {
+		// Ensure consistent ordering (smaller cluster name first lexicographically)
+		if conn.Source < conn.Destination {
+			connectionMap[clusterConnection{
+				source:      conn.Source,
+				destination: conn.Destination,
+			}] = struct{}{}
+		} else if conn.Source > conn.Destination {
+			connectionMap[clusterConnection{
+				source:      conn.Destination,
+				destination: conn.Source,
+			}] = struct{}{}
+		}
+		// Ignore self-connections (source == destination)
+	}
+	return connectionMap
 }
 
 // createMinimumGateWayPairIfNotExists is a function to create the pair of gatways between 2 clusters if not exists

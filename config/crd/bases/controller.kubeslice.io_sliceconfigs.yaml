@@ -224,6 +224,66 @@ spec:
                 type: string
               standardQosProfileName:
                 type: string
+              topologyConfig:
+                description: TopologyConfig defines custom connectivity topology for
+                  the slice
+                properties:
+                  clusterVpnRoles:
+                    description: ClusterVPNRoles defines VPN roles for each cluster
+                      (client/server/auto)
+                    items:
+                      description: ClusterVPNRole defines the VPN role for a specific
+                        cluster
+                      properties:
+                        clusterName:
+                          description: ClusterName is the name of the cluster
+                          type: string
+                        role:
+                          default: auto
+                          description: Role defines whether the cluster acts as VPN
+                            client, server, or auto-determined
+                          enum:
+                          - client
+                          - server
+                          - auto
+                          type: string
+                      required:
+                      - clusterName
+                      type: object
+                    type: array
+                  customConnections:
+                    description: CustomConnections defines explicit connections for
+                      custom and partial-mesh topologies
+                    items:
+                      description: ClusterConnection defines a connection between
+                        two clusters
+                      properties:
+                        destination:
+                          description: Destination cluster name
+                          type: string
+                        source:
+                          description: Source cluster name
+                          type: string
+                      required:
+                      - destination
+                      - source
+                      type: object
+                    type: array
+                  hubCluster:
+                    description: HubCluster defines the hub cluster name for hub-spoke
+                      topology
+                    type: string
+                  topologyType:
+                    default: full-mesh
+                    description: TopologyType defines the connectivity pattern (full-mesh,
+                      partial-mesh, hub-spoke, custom)
+                    enum:
+                    - full-mesh
+                    - partial-mesh
+                    - hub-spoke
+                    - custom
+                    type: string
+                type: object
               vpnConfig:
                 description: VPNConfiguration defines the additional (optional) VPN
                   Configuration to customise
