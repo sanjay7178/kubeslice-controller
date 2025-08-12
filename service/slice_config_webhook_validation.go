@@ -71,6 +71,9 @@ func ValidateSliceConfigCreate(ctx context.Context, sliceConfig *controllerv1alp
 		if err := validateExternalGatewayConfig(sliceConfig); err != nil {
 			return apierrors.NewInvalid(schema.GroupKind{Group: apiGroupKubeSliceControllers, Kind: "SliceConfig"}, sliceConfig.Name, field.ErrorList{err})
 		}
+		if err := validateTopologyConfig(sliceConfig); err != nil {
+			return apierrors.NewInvalid(schema.GroupKind{Group: apiGroupKubeSliceControllers, Kind: "SliceConfig"}, sliceConfig.Name, field.ErrorList{err})
+		}
 	}
 	return nil
 }
@@ -122,6 +125,9 @@ func ValidateSliceConfigUpdate(ctx context.Context, sliceConfig *controllerv1alp
 			return apierrors.NewInvalid(schema.GroupKind{Group: apiGroupKubeSliceControllers, Kind: "SliceConfig"}, sliceConfig.Name, field.ErrorList{err})
 		}
 		if err := validateExternalGatewayConfig(sliceConfig); err != nil {
+			return apierrors.NewInvalid(schema.GroupKind{Group: apiGroupKubeSliceControllers, Kind: "SliceConfig"}, sliceConfig.Name, field.ErrorList{err})
+		}
+		if err := validateTopologyConfig(sliceConfig); err != nil {
 			return apierrors.NewInvalid(schema.GroupKind{Group: apiGroupKubeSliceControllers, Kind: "SliceConfig"}, sliceConfig.Name, field.ErrorList{err})
 		}
 
@@ -674,4 +680,102 @@ func checkIfQoSConfigExists(ctx context.Context, namespace string, qosProfileNam
 		return false
 	}
 	return found
+}
+
+// validateTopologyConfig validates the topology configuration for slice
+func validateTopologyConfig(sliceConfig *controllerv1alpha1.SliceConfig) *field.Error {
+	if sliceConfig.Spec.TopologyConfig == nil {
+		return nil // topology config is optional
+	}
+
+	topologyConfig := sliceConfig.Spec.TopologyConfig
+	clusters := sliceConfig.Spec.Clusters
+
+	// Validate hub-spoke topology
+	if topologyConfig.TopologyType == controllerv1alpha1.HUB_SPOKE {
+		if topologyConfig.HubCluster == "" {
+			return field.Required(field.NewPath("spec").Child("topologyConfig").Child("hubCluster"),
+				"hubCluster must be specified for hub-spoke topology")
+		}
+
+		// Verify hub cluster exists in the clusters list
+		hubExists := false
+		for _, cluster := range clusters {
+			if cluster == topologyConfig.HubCluster {
+				hubExists = true
+				break
+			}
+		}
+		if !hubExists {
+			return field.Invalid(field.NewPath("spec").Child("topologyConfig").Child("hubCluster"),
+				topologyConfig.HubCluster, "hub cluster must be present in the clusters list")
+		}
+	}
+
+	// Validate custom/partial-mesh topology
+	if topologyConfig.TopologyType == controllerv1alpha1.CUSTOM || topologyConfig.TopologyType == controllerv1alpha1.PARTIAL_MESH {
+		if len(topologyConfig.CustomConnections) == 0 {
+			return field.Required(field.NewPath("spec").Child("topologyConfig").Child("customConnections"),
+				"customConnections must be specified for custom/partial-mesh topology")
+		}
+
+		// Create a map of valid clusters for quick lookup
+		clusterMap := make(map[string]bool)
+		for _, cluster := range clusters {
+			clusterMap[cluster] = true
+		}
+
+		// Validate each custom connection
+		for i, conn := range topologyConfig.CustomConnections {
+			connPath := field.NewPath("spec").Child("topologyConfig").Child("customConnections").Index(i)
+
+			if conn.Source == "" {
+				return field.Required(connPath.Child("source"), "source cluster name is required")
+			}
+			if conn.Destination == "" {
+				return field.Required(connPath.Child("destination"), "destination cluster name is required")
+			}
+			if conn.Source == conn.Destination {
+				return field.Invalid(connPath, conn, "source and destination cannot be the same cluster")
+			}
+
+			// Verify source cluster exists in the clusters list
+			if !clusterMap[conn.Source] {
+				return field.Invalid(connPath.Child("source"), conn.Source,
+					"source cluster must be present in the clusters list")
+			}
+
+			// Verify destination cluster exists in the clusters list
+			if !clusterMap[conn.Destination] {
+				return field.Invalid(connPath.Child("destination"), conn.Destination,
+					"destination cluster must be present in the clusters list")
+			}
+		}
+	}
+
+	// Validate cluster VPN roles
+	if len(topologyConfig.ClusterVPNRoles) > 0 {
+		// Create a map of valid clusters for quick lookup
+		clusterMap := make(map[string]bool)
+		for _, cluster := range clusters {
+			clusterMap[cluster] = true
+		}
+
+		// Validate each VPN role assignment
+		for i, role := range topologyConfig.ClusterVPNRoles {
+			rolePath := field.NewPath("spec").Child("topologyConfig").Child("clusterVpnRoles").Index(i)
+
+			if role.ClusterName == "" {
+				return field.Required(rolePath.Child("clusterName"), "cluster name is required")
+			}
+
+			// Verify cluster exists in the clusters list
+			if !clusterMap[role.ClusterName] {
+				return field.Invalid(rolePath.Child("clusterName"), role.ClusterName,
+					"cluster must be present in the clusters list")
+			}
+		}
+	}
+
+	return nil
 }
