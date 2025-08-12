@@ -47,6 +47,55 @@ const (
 	ENVOY GatewayType = "envoy"
 )
 
+// +kubebuilder:validation:Enum:=full-mesh;partial-mesh;hub-spoke;custom
+type TopologyType string
+
+const (
+	FULL_MESH    TopologyType = "full-mesh"
+	PARTIAL_MESH TopologyType = "partial-mesh"
+	HUB_SPOKE    TopologyType = "hub-spoke"
+	CUSTOM       TopologyType = "custom"
+)
+
+// +kubebuilder:validation:Enum:=client;server;auto
+type VPNRole string
+
+const (
+	VPN_CLIENT VPNRole = "client"
+	VPN_SERVER VPNRole = "server"
+	VPN_AUTO   VPNRole = "auto"
+)
+
+// TopologyConfig defines the custom connectivity topology for the slice
+type TopologyConfig struct {
+	//+kubebuilder:default:=full-mesh
+	// TopologyType defines the connectivity pattern (full-mesh, partial-mesh, hub-spoke, custom)
+	TopologyType TopologyType `json:"topologyType,omitempty"`
+	// CustomConnections defines explicit connections for custom and partial-mesh topologies
+	CustomConnections []ClusterConnection `json:"customConnections,omitempty"`
+	// HubCluster defines the hub cluster name for hub-spoke topology
+	HubCluster string `json:"hubCluster,omitempty"`
+	// ClusterVPNRoles defines VPN roles for each cluster (client/server/auto)
+	ClusterVPNRoles []ClusterVPNRole `json:"clusterVpnRoles,omitempty"`
+}
+
+// ClusterConnection defines a connection between two clusters
+type ClusterConnection struct {
+	// Source cluster name
+	Source string `json:"source"`
+	// Destination cluster name
+	Destination string `json:"destination"`
+}
+
+// ClusterVPNRole defines the VPN role for a specific cluster
+type ClusterVPNRole struct {
+	// ClusterName is the name of the cluster
+	ClusterName string `json:"clusterName"`
+	// Role defines whether the cluster acts as VPN client, server, or auto-determined
+	//+kubebuilder:default:=auto
+	Role VPNRole `json:"role,omitempty"`
+}
+
 // SliceConfigSpec defines the desired state of SliceConfig
 type SliceConfigSpec struct {
 	//+kubebuilder:default:=single-network
@@ -74,6 +123,8 @@ type SliceConfigSpec struct {
 	// RenewBefore is used for renew now!
 	RenewBefore *metav1.Time      `json:"renewBefore,omitempty"`
 	VPNConfig   *VPNConfiguration `json:"vpnConfig,omitempty"`
+	// TopologyConfig defines custom connectivity topology for the slice
+	TopologyConfig *TopologyConfig `json:"topologyConfig,omitempty"`
 }
 
 // ExternalGatewayConfig is the configuration for external gateways like 'istio', etc/
